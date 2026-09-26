@@ -188,12 +188,13 @@ button.danger { background: linear-gradient(145deg, #7a3232, #431414); border-co
 button.danger:hover { background: linear-gradient(145deg, #953d3d, #5a1c1c); }
 
 .icon-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
+.icon-grid.icon-grid-4 { grid-template-columns: repeat(4, 1fr); }
 .icon-grid button { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: 11px 4px; }
 .icon-grid .icon { display: flex; align-items: center; justify-content: center; width: 20px; height: 20px; }
 .icon-grid .icon svg { width: 100%; height: 100%; }
 .icon-grid .label { font-size: 10px; letter-spacing: .3px; }
 @media (max-width: 360px) {
-  .icon-grid { grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .icon-grid, .icon-grid.icon-grid-4 { grid-template-columns: repeat(2, 1fr); }
 }
 
 .mode-buttons button, .difficulty-buttons button, .theme-buttons button { display: flex; align-items: center; justify-content: center; gap: 6px; }
@@ -373,7 +374,7 @@ button.danger:hover { background: linear-gradient(145deg, #953d3d, #5a1c1c); }
     <span class="btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg></span>
     NEW GAME
   </button>
-  <div class="icon-grid">
+  <div class="icon-grid icon-grid-4">
     <button onclick="undoMove()">
       <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11a9 9 0 1 1 2.6 6.4"/><path d="M3 5v6h6"/></svg></span>
       <span class="label">Undo</span>
@@ -385,6 +386,10 @@ button.danger:hover { background: linear-gradient(145deg, #953d3d, #5a1c1c); }
     <button onclick="flipBoard()">
       <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3v13"/><path d="M4 13l3 3 3-3"/><path d="M17 21V8"/><path d="M20 11l-3-3-3 3"/></svg></span>
       <span class="label">Flip</span>
+    </button>
+    <button id="soundButton" onclick="toggleSound()">
+      <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10v4h4l5 4V6L8 10H4z"/><path d="M17 9a5 5 0 0 1 0 6"/><path d="M19.5 7a9 9 0 0 1 0 10"/></svg></span>
+      <span class="label">Sound</span>
     </button>
   </div>
 </div>
@@ -481,6 +486,11 @@ let blackTime = 0;
 let clockInterval = null;
 
 let boardTheme = "green";
+let soundOn = true;
+let audioCtx = null;
+let masterGainNode = null;
+let compressorNode = null;
+const MASTER_VOLUME = 1.9;
 
 let castling = {
   whiteKing: true, whiteRookKing: true, whiteRookQueen: true,
@@ -488,6 +498,163 @@ let castling = {
 };
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+/* ========================================= AUDIO ========================================= */
+function ensureAudio() {
+  if (!audioCtx) {
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      // A soft limiter on the master bus lets the overall volume run louder without
+      // digital clipping/distortion when several sound layers overlap.
+      compressorNode = audioCtx.createDynamicsCompressor();
+      compressorNode.threshold.value = -14;
+      compressorNode.knee.value = 18;
+      compressorNode.ratio.value = 6;
+      compressorNode.attack.value = 0.002;
+      compressorNode.release.value = 0.15;
+      compressorNode.connect(audioCtx.destination);
+      masterGainNode = audioCtx.createGain();
+      masterGainNode.gain.value = MASTER_VOLUME;
+      masterGainNode.connect(compressorNode);
+    } catch (e) { audioCtx = null; }
+  }
+  if (audioCtx && audioCtx.state === "suspended") { try { audioCtx.resume(); } catch (e) {} }
+}
+
+function makeNoiseBuffer(duration) {
+  const len = Math.max(1, Math.floor(audioCtx.sampleRate * duration));
+  const buffer = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+  return buffer;
+}
+
+/* Matches a reference click that was measured at: ~10ms total length, instant attack,
+   a resonant tone centered ~500-700Hz, a tiny secondary micro-bounce ~5ms later,
+   and almost no energy below 150Hz or above 3kHz (i.e. a dry, short "tick", not a thump). */
+function playClick(intensity, delay) {
+  if (!soundOn) return;
+  ensureAudio();
+  if (!audioCtx) return;
+  intensity = intensity || 1;
+  const t = audioCtx.currentTime + (delay || 0);
+  try {
+    const noise = audioCtx.createBufferSource();
+    noise.buffer = makeNoiseBuffer(0.02);
+    const bandpass = audioCtx.createBiquadFilter();
+    bandpass.type = "bandpass";
+    bandpass.frequency.value = 620;
+    bandpass.Q.value = 2.1;
+    const gain = audioCtx.createGain();
+    gain.gain.setValueAtTime(0.85 * intensity, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.009);
+    noise.connect(bandpass); bandpass.connect(gain); gain.connect(masterGainNode);
+    noise.start(t); noise.stop(t + 0.014);
+
+    const echo = audioCtx.createBufferSource();
+    echo.buffer = makeNoiseBuffer(0.015);
+    const bandpass2 = audioCtx.createBiquadFilter();
+    bandpass2.type = "bandpass";
+    bandpass2.frequency.value = 620;
+    bandpass2.Q.value = 2.1;
+    const gain2 = audioCtx.createGain();
+    gain2.gain.setValueAtTime(0.32 * intensity, t + 0.005);
+    gain2.gain.exponentialRampToValueAtTime(0.001, t + 0.012);
+    echo.connect(bandpass2); bandpass2.connect(gain2); gain2.connect(masterGainNode);
+    echo.start(t + 0.005); echo.stop(t + 0.013);
+  } catch (e) {}
+}
+
+/* Reproduces the real chess.com capture sound's measured structure: a bright ~3.9kHz
+   "crack" onset (0-6ms), a mid ~1.5kHz "punch" (5-20ms), and a resonant ~1.35kHz tail
+   ringing out over ~180ms. Parameters were fitted by simulating this exact filter graph
+   in Python against the actual capture.mp3 and matching its per-segment spectral profile. */
+function playCaptureSnap(intensity, delay) {
+  if (!soundOn) return;
+  ensureAudio();
+  if (!audioCtx) return;
+  intensity = intensity || 1;
+  const t = audioCtx.currentTime + (delay || 0);
+  const dur = 0.28;
+  try {
+    // Layer 1: bright crack (~3900Hz)
+    const n1 = audioCtx.createBufferSource();
+    n1.buffer = makeNoiseBuffer(dur);
+    const lp1 = audioCtx.createBiquadFilter(); lp1.type = "lowpass"; lp1.frequency.value = 11000; lp1.Q.value = 0.707;
+    const bp1 = audioCtx.createBiquadFilter(); bp1.type = "bandpass"; bp1.frequency.value = 3900; bp1.Q.value = 2.5;
+    const g1 = audioCtx.createGain();
+    g1.gain.setValueAtTime(0.95 * intensity, t);
+    g1.gain.exponentialRampToValueAtTime(0.001 * intensity, t + 0.006);
+    n1.connect(lp1); lp1.connect(bp1); bp1.connect(g1); g1.connect(masterGainNode);
+    n1.start(t); n1.stop(t + dur);
+
+    // Layer 2: mid punch (~1480Hz)
+    const n2 = audioCtx.createBufferSource();
+    n2.buffer = makeNoiseBuffer(dur);
+    const lp2 = audioCtx.createBiquadFilter(); lp2.type = "lowpass"; lp2.frequency.value = 4000; lp2.Q.value = 0.707;
+    const bp2 = audioCtx.createBiquadFilter(); bp2.type = "bandpass"; bp2.frequency.value = 1480; bp2.Q.value = 6;
+    const g2 = audioCtx.createGain();
+    g2.gain.setValueAtTime(0.0001, t);
+    g2.gain.exponentialRampToValueAtTime(0.8 * intensity, t + 0.005);
+    g2.gain.exponentialRampToValueAtTime(0.01 * intensity, t + 0.018);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.05);
+    n2.connect(lp2); lp2.connect(bp2); bp2.connect(g2); g2.connect(masterGainNode);
+    n2.start(t); n2.stop(t + dur);
+
+    // Layer 3: resonant tail ring (~1350Hz), decaying out to ~180ms
+    const n3 = audioCtx.createBufferSource();
+    n3.buffer = makeNoiseBuffer(dur);
+    const lp3 = audioCtx.createBiquadFilter(); lp3.type = "lowpass"; lp3.frequency.value = 2800; lp3.Q.value = 0.707;
+    const bp3 = audioCtx.createBiquadFilter(); bp3.type = "bandpass"; bp3.frequency.value = 1350; bp3.Q.value = 11;
+    const g3 = audioCtx.createGain();
+    g3.gain.setValueAtTime(0.0001, t);
+    g3.gain.exponentialRampToValueAtTime(0.4 * intensity, t + 0.012);
+    g3.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+    n3.connect(lp3); lp3.connect(bp3); bp3.connect(g3); g3.connect(masterGainNode);
+    n3.start(t); n3.stop(t + dur);
+  } catch (e) {}
+}
+
+/* Soft musical tone, used only for alerts (check / checkmate / draw), not for piece movement. */
+function playChime(freq, duration, gain, delay) {
+  if (!soundOn) return;
+  ensureAudio();
+  if (!audioCtx) return;
+  try {
+    const t = audioCtx.currentTime + (delay || 0);
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(freq, t);
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(gain || 0.12, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+    osc.connect(g); g.connect(masterGainNode);
+    osc.start(t); osc.stop(t + duration + 0.03);
+  } catch (e) {}
+}
+
+function playSound(kind) {
+  if (kind === "select") playClick(0.7);
+  else if (kind === "move") playClick(1);
+  else if (kind === "capture") playCaptureSnap(1);
+  else if (kind === "castle") { playClick(1, 0); playClick(0.9, 0.08); }
+  else if (kind === "promote") { playClick(1.2); playChime(880, .15, .1, .06); }
+  else if (kind === "check") playChime(760, .14, .11);
+  else if (kind === "checkmate") { playChime(587, .2, .13); playChime(440, .28, .13, .18); playChime(330, .35, .12, .36); }
+  else if (kind === "draw") { playChime(392, .22, .1); playChime(392, .22, .1, .2); }
+}
+
+function toggleSound() {
+  soundOn = !soundOn;
+  const btn = document.getElementById("soundButton");
+  btn.querySelector(".icon").innerHTML = soundOn
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10v4h4l5 4V6L8 10H4z"/><path d="M17 9a5 5 0 0 1 0 6"/><path d="M19.5 7a9 9 0 0 1 0 10"/></svg>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10v4h4l5 4V6L8 10H4z"/><path d="M16 9l5 5M21 9l-5 5"/></svg>';
+  btn.querySelector(".label").textContent = soundOn ? "Sound" : "Muted";
+  if (soundOn) playClick(0.8);
+}
+
 
 
 /* ========================================= BOARD SETUP ========================================= */
@@ -585,6 +752,7 @@ function flipBoard() {
 async function handleSquareClick(r, c) {
   if (gameOver || botThinking) return;
   if (gameMode === "bot" && turn === botColor) return;
+  ensureAudio();
 
   const piece = board[r][c];
 
@@ -850,15 +1018,23 @@ async function makeMove(fr, fc, tr, tc, move) {
   lastMove = { fr, fc, tr, tc };
   drawBoard();
 
+  const isCapture = !!(target || move.enPassant);
+  const isCastle = !!move.castle;
+
+  await sleep(230); // let the slide/capture-fade animation finish before the piece "lands" audibly
+  if (isCapture) playSound("capture");
+  else if (isCastle) playSound("castle");
+  else playSound("move");
+
   let promoted = false;
   if (piece.type === "pawn" && (tr === 0 || tr === 7)) {
-    await sleep(160);
     let choice;
     if (gameMode === "bot" && piece.color === botColor) choice = "Q";
     else choice = await askPromotionChoice(piece.color);
     piece.type = promotionMap[choice] || "queen";
     promoted = true;
     drawBoard();
+    playSound("promote");
   }
 
   const notation = createNotation(piece, fr, fc, tr, tc, target, move);
@@ -870,7 +1046,7 @@ async function makeMove(fr, fc, tr, tc, move) {
   updateMoves();
   updateStatus();
 
-  await sleep(150);
+  await sleep(120);
 }
 
 /* ========================================= EVALUATION / AI ========================================= */
@@ -1006,9 +1182,9 @@ async function botMove() {
     scored.sort((a, b) => b.score - a.score);
     chosen = scored[0].item;
   } else if (difficulty === "hard") {
-    chosen = await computeSearchMove(moves, 2, 2500);
+    chosen = await computeSearchMove(moves, 3, 3200);
   } else {
-    chosen = await computeSearchMove(moves, 3, 4200);
+    chosen = await computeSearchMove(moves, 4, 6000);
   }
   if (!chosen) chosen = moves[Math.floor(Math.random() * moves.length)];
 
@@ -1106,6 +1282,7 @@ function checkGameState() {
 
   if (inCheck) {
     document.getElementById("message").textContent = "CHECK!";
+    playSound("check");
   } else {
     document.getElementById("message").textContent = "Select a piece to move";
   }
@@ -1126,8 +1303,10 @@ function endGame(type, winnerColor) {
     icon = "🏆"; title = "Checkmate!";
     subtitle = (winnerColor === "white" ? "White" : "Black") + " wins";
     confetti = true;
+    playSound("checkmate");
   } else if (type === "stalemate") {
     icon = "🤝"; title = "Stalemate"; subtitle = "Draw";
+    playSound("draw");
   } else if (type === "resign") {
     icon = "🏳️"; title = "Resignation";
     subtitle = (winnerColor === "white" ? "White" : "Black") + " wins by resignation";
